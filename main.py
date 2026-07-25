@@ -1,66 +1,134 @@
-import os, json, random
+import os, json, time, datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from src.places_fetcher import fetch_leads_for_keyword
+from src.places_fetcher import fetch_place_ids
+from src.place_details import fetch_place_details
 from src.validator import validate_lead
 from src.deduplicator import get_existing_identifiers, filter_new_leads
 from src.email_enricher import enrich_email_if_needed
 
-# Load config
+# Load configuration
 config_path = os.path.join('config', 'keywords.json')
 with open(config_path) as f:
     cfg = json.load(f)
 
-# Prepare Google Sheet connection
+# Load (or create) persistent state
+state_path = os.path.join('config', 'state.json')
+if not os.path.exists(state_path):
+    state = {
+        "keyword_index": 0,
+        "city_index": 0,
+        "details_used_today": 0,
+        "last_run_date": ""
+    }
+    with open(state_path, "w") as sf:
+        json.dump(state, sf, indent=2)
+else:
+    with open(state_path) as sf:
+        state = json.load(sf)
+
+# Reset daily details counter if a new UTC day started
+today = datetime.datetime.utcnow().date().isoformat()
+if state.get("last_run_date") != today:
+    state["details_used_today"] = 0
+    state["last_run_date"] = today
+
+# Prepare indices
+keyword_idx = state["keyword_index"]
+city_idx = state["city_index"]
+details_used = state["details_used_today"]
+
+keywords = cfg["keywords"]
+all_cities = [c for cities in cfg["countries"].values() for c in cities]
+current_keyword = keywords[keyword_idx]
+
+# Environment‑controlled limits (safe for free tier)
+DAILY_DETAILS_BUDGET = int(os.getenv('DAILY_PLACE_DETAILS_BUDGET', '300'))  # max Place Details calls per run
+MAX_RESULTS_PER_CITY = int(os.getenv('MAX_RESULTS_PER_CITY', '30'))        # max IDs returned per city
+MAX_NEW_LEADS_PER_RUN = int(os.getenv('MAX_NEW_LEADS_PER_RUN', '250'))    # safety cap on rows written
+
+new_leads = []
+processed_cities = 0
+
+# Google Sheet connection
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
 creds = ServiceAccountCredentials.from_json_keyfile_name(service_account_json, scope)
 client = gspread.authorize(creds)
 sheet = client.open_by_key(os.getenv('GOOGLE_SHEET_ID')).sheet1
 
-# Daily sampling
-FULL = cfg.get('generated_searches', [])
-DAILY_COMBO_COUNT = int(os.getenv('DAILY_COMBO_COUNT', 10))
-
-today_searches = random.sample(FULL, DAILY_COMBO_COUNT)
-
-all_raw_leads = []
-for combo in today_searches:
-    leads = fetch_leads_for_keyword(combo['query'], combo['location'], limit=cfg.get('results_per_keyword', 30))
-    for lead in leads:
-        lead['search_keyword'] = combo['query']
-        lead['search_city'] = combo['location']
-        # Optional email enrichment
+while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities):
+    city = all_cities[city_idx]
+    # 1️⃣ Get place IDs for this city+keyword (free unlimited call)
+    place_ids = fetch_place_ids(current_keyword, city, limit=MAX_RESULTS_PER_CITY)
+    # 2️⃣ For each ID, fetch full details (costly call, counts against quota)
+    for pid in place_ids:
+        if details_used >= DAILY_DETAILS_BUDGET:
+            break
+        details = fetch_place_details(pid)
+        if not details:
+            continue
+        lead = {
+            "name": details.get('name'),
+            "phone": details.get('formatted_phone_number'),
+            "website": details.get('website'),
+            "place_id": details.get('place_id'),
+            "search_keyword": current_keyword,
+            "search_city": city,
+        }
+        # Optional email enrichment (does NOT use Google quota)
         if os.getenv('ENABLE_EMAIL_ENRICH', 'true').lower() == 'true':
             lead = enrich_email_if_needed(lead)
         lead = validate_lead(lead)
         if lead.get('is_valid'):
-            all_raw_leads.append(lead)
+            new_leads.append(lead)
+        details_used += 1
+    # move to next city
+    city_idx = (city_idx + 1) % len(all_cities)
+    processed_cities += 1
 
-# Deduplication against sheet
+# ----------------------------------------------------------------------
+# Deduplicate against existing sheet entries
+# ----------------------------------------------------------------------
 existing_ids, existing_emails = get_existing_identifiers(sheet)
-new_leads = filter_new_leads(all_raw_leads, existing_ids, existing_emails)
+new_leads = filter_new_leads(new_leads, existing_ids, existing_emails)
 
-# Write to sheet
-rows = []
-for lead in new_leads:
-    rows.append([
-        lead.get('date_added', ''),
-        lead.get('name', ''),
-        lead.get('phone', ''),
-        lead.get('phone_intl', ''),
-        lead.get('email', ''),
-        lead.get('website', ''),
-        lead.get('address', ''),
-        lead.get('rating', ''),
-        lead.get('user_ratings_total', ''),
-        lead.get('search_keyword', ''),
-        lead.get('search_city', ''),
-        lead.get('place_id', ''),
-        lead.get('quality_score', ''),
-        lead.get('category', '')
-    ])
-if rows:
+# Optional safety cap on how many rows we write in one run
+if len(new_leads) > MAX_NEW_LEADS_PER_RUN:
+    new_leads = new_leads[:MAX_NEW_LEADS_PER_RUN]
+
+# ----------------------------------------------------------------------
+# Write new rows to Google Sheet
+# ----------------------------------------------------------------------
+if new_leads:
+    rows = []
+    for lead in new_leads:
+        rows.append([
+            lead.get('date_added', ''),
+            lead.get('name', ''),
+            lead.get('phone', ''),
+            lead.get('phone_intl', ''),
+            lead.get('email', ''),
+            lead.get('website', ''),
+            lead.get('address', ''),
+            lead.get('rating', ''),
+            lead.get('user_ratings_total', ''),
+            lead.get('search_keyword', ''),
+            lead.get('search_city', ''),
+            lead.get('place_id', ''),
+            lead.get('quality_score', ''),
+            lead.get('category', ''),
+        ])
     sheet.append_rows(rows, value_input_option='RAW')
+    print(f"Completed: {len(new_leads)} new leads added for keyword '{current_keyword}'.")
+else:
+    print(f"No new leads for keyword '{current_keyword}'.")
 
-print(f"Completed: {len(new_leads)} new leads added.")
+# ----------------------------------------------------------------------
+# Persist updated state for next run
+# ----------------------------------------------------------------------
+state["keyword_index"] = (keyword_idx + (city_idx == 0)) % len(keywords)
+state["city_index"] = city_idx
+state["details_used_today"] = details_used
+with open(state_path, "w") as sf:
+    json.dump(state, sf, indent=2)
