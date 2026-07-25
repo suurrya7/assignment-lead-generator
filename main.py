@@ -53,7 +53,23 @@ processed_cities = 0
 # Google Sheet connection
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
-creds = ServiceAccountCredentials.from_json_keyfile_name(service_account_json, scope)
+if not service_account_json:
+    raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable')
+# Try to interpret as file path; if that fails, fall back to raw JSON.
+if os.path.isfile(service_account_json):
+    creds = ServiceAccountCredentials.from_json_keyfile_name(service_account_json, scope)
+else:
+    # Assume raw JSON string
+    try:
+        sa_raw = service_account_json.strip()
+        if (sa_raw.startswith('"') and sa_raw.endswith('"')) or (sa_raw.startswith("'") and sa_raw.endswith("'")):
+            sa_raw = sa_raw[1:-1]
+        if not (sa_raw.startswith('{') and sa_raw.endswith('}')):
+            sa_raw = '{' + sa_raw + '}'
+        sa_info = json.loads(sa_raw)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_info, scope)
+    except Exception as e:
+        raise RuntimeError('Invalid GOOGLE_SERVICE_ACCOUNT_JSON') from e
 client = gspread.authorize(creds)
 sheet = client.open_by_key(os.getenv('GOOGLE_SHEET_ID')).sheet1
 
