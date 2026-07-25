@@ -31,10 +31,3 @@ jobs:
           DAILY_COMBO_COUNT: ${{ secrets.DAILY_COMBO_COUNT }}
         run: |
           python main.py
-
-      - name: Verify Leads (website check)
-        env:
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python verify_leads.py
