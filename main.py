@@ -6,6 +6,7 @@ from src.place_details import fetch_place_details
 from src.validator import validate_lead
 from src.deduplicator import get_existing_identifiers, filter_new_leads
 from src.email_enricher import enrich_email_if_needed
+from src.relevance_filter import is_relevant_lead
 
 # Load configuration
 config_path = os.path.join('config', 'keywords.json')
@@ -106,6 +107,11 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
         # Optional email enrichment (does NOT use Google quota)
         if os.getenv('ENABLE_EMAIL_ENRICH', 'true').lower() == 'true':
             lead = enrich_email_if_needed(lead)
+        # 3️⃣ Relevance filter — skip businesses unrelated to academic services
+        if not is_relevant_lead(lead):
+            print(f"[main] SKIPPED (irrelevant): {lead.get('name')}")
+            details_used += 1
+            continue
         lead = validate_lead(lead)
         print(f"[main] Lead: {lead.get('name')} | score={lead.get('quality_score')} | valid={lead.get('is_valid')}")
         if lead.get('is_valid'):
