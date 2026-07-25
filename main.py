@@ -1,4 +1,4 @@
-import os, json, time, datetime
+import os, json, re, time, datetime
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from src.places_fetcher import fetch_place_ids
@@ -96,6 +96,7 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
         lead = {
             "name": details.get('name'),
             "phone": details.get('formatted_phone_number'),
+            "phone_intl": details.get('international_phone_number'),
             "website": details.get('website'),
             "address": details.get('address'),
             "rating": details.get('rating'),
@@ -104,6 +105,10 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
             "search_keyword": current_keyword,
             "search_city": city,
         }
+        # Generate WhatsApp number: country code + number, digits only, no + sign
+        intl = details.get('international_phone_number') or ''
+        whatsapp = re.sub(r'[^0-9]', '', intl)  # strip everything except digits
+        lead['whatsapp'] = whatsapp
         # Optional email enrichment (does NOT use Google quota)
         if os.getenv('ENABLE_EMAIL_ENRICH', 'true').lower() == 'true':
             lead = enrich_email_if_needed(lead)
@@ -138,6 +143,7 @@ if new_leads:
             lead.get('name', ''),
             lead.get('phone', ''),
             lead.get('phone_intl', ''),
+            lead.get('whatsapp', ''),
             lead.get('email', ''),
             lead.get('website', ''),
             lead.get('address', ''),
