@@ -75,19 +75,30 @@ sheet = client.open_by_key(os.getenv('GOOGLE_SHEET_ID')).sheet1
 
 while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities):
     city = all_cities[city_idx]
+    print(f"\n--- Processing city: {city} | keyword: {current_keyword} ---")
     # 1️⃣ Get place IDs for this city+keyword (free unlimited call)
     place_ids = fetch_place_ids(current_keyword, city, limit=MAX_RESULTS_PER_CITY)
+    print(f"[main] Got {len(place_ids)} place IDs for '{city}'")
+    if not place_ids:
+        print(f"[main] No place IDs found, skipping city")
+        city_idx = (city_idx + 1) % len(all_cities)
+        processed_cities += 1
+        continue
     # 2️⃣ For each ID, fetch full details (costly call, counts against quota)
     for pid in place_ids:
         if details_used >= DAILY_DETAILS_BUDGET:
             break
         details = fetch_place_details(pid)
         if not details:
+            print(f"[main] No details for place_id={pid}")
             continue
         lead = {
             "name": details.get('name'),
             "phone": details.get('formatted_phone_number'),
             "website": details.get('website'),
+            "address": details.get('address'),
+            "rating": details.get('rating'),
+            "user_ratings_total": details.get('user_ratings_total'),
             "place_id": details.get('place_id'),
             "search_keyword": current_keyword,
             "search_city": city,
@@ -96,6 +107,7 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
         if os.getenv('ENABLE_EMAIL_ENRICH', 'true').lower() == 'true':
             lead = enrich_email_if_needed(lead)
         lead = validate_lead(lead)
+        print(f"[main] Lead: {lead.get('name')} | score={lead.get('quality_score')} | valid={lead.get('is_valid')}")
         if lead.get('is_valid'):
             new_leads.append(lead)
         details_used += 1
