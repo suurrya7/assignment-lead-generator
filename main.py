@@ -13,54 +13,24 @@ config_path = os.path.join('config', 'keywords.json')
 with open(config_path) as f:
     cfg = json.load(f)
 
-# Load (or create) persistent state
-state_path = os.path.join('config', 'state.json')
-if not os.path.exists(state_path):
-    state = {
-        "keyword_index": 0,
-        "city_index": 0,
-        "details_used_today": 0,
-        "last_run_date": ""
-    }
-    with open(state_path, "w") as sf:
-        json.dump(state, sf, indent=2)
-else:
-    with open(state_path) as sf:
-        state = json.load(sf)
-
-# Reset daily details counter if a new UTC day started
-today = datetime.datetime.utcnow().date().isoformat()
-if state.get("last_run_date") != today:
-    state["details_used_today"] = 0
-    state["last_run_date"] = today
-
-# Prepare indices
-keyword_idx = state["keyword_index"]
-city_idx = state["city_index"]
-details_used = state["details_used_today"]
-
 keywords = cfg["keywords"]
 all_cities = [c for cities in cfg["countries"].values() for c in cities]
-current_keyword = keywords[keyword_idx]
 
-# Environment‑controlled limits (safe for free tier)
-DAILY_DETAILS_BUDGET = int(os.getenv('DAILY_PLACE_DETAILS_BUDGET', '300'))  # max Place Details calls per run
-MAX_RESULTS_PER_CITY = int(os.getenv('MAX_RESULTS_PER_CITY', '30'))        # max IDs returned per city
-MAX_NEW_LEADS_PER_RUN = int(os.getenv('MAX_NEW_LEADS_PER_RUN', '250'))    # safety cap on rows written
+# Environment-controlled limits (safe for free tier)
+DAILY_DETAILS_BUDGET = int(os.getenv('DAILY_PLACE_DETAILS_BUDGET', '300'))
+MAX_RESULTS_PER_CITY = int(os.getenv('MAX_RESULTS_PER_CITY', '30'))
+MAX_NEW_LEADS_PER_RUN = int(os.getenv('MAX_NEW_LEADS_PER_RUN', '250'))
 
-new_leads = []
-processed_cities = 0
-
+# ----------------------------------------------------------------------
 # Google Sheet connection
+# ----------------------------------------------------------------------
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
 if not service_account_json:
     raise RuntimeError('Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable')
-# Try to interpret as file path; if that fails, fall back to raw JSON.
 if os.path.isfile(service_account_json):
     creds = ServiceAccountCredentials.from_json_keyfile_name(service_account_json, scope)
 else:
-    # Assume raw JSON string
     try:
         sa_raw = service_account_json.strip()
         if (sa_raw.startswith('"') and sa_raw.endswith('"')) or (sa_raw.startswith("'") and sa_raw.endswith("'")):
@@ -71,18 +41,91 @@ else:
         creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_info, scope)
     except Exception as e:
         raise RuntimeError('Invalid GOOGLE_SERVICE_ACCOUNT_JSON') from e
+
 client = gspread.authorize(creds)
-sheet = client.open_by_key(os.getenv('GOOGLE_SHEET_ID')).sheet1
+spreadsheet = client.open_by_key(os.getenv('GOOGLE_SHEET_ID'))
+sheet = spreadsheet.sheet1  # leads go here
+
+
+# ----------------------------------------------------------------------
+# State management — stored in a "State" tab inside the same Google Sheet
+# so progress persists across GitHub Actions runs.
+# ----------------------------------------------------------------------
+def get_or_create_state_sheet(spreadsheet):
+    """Get or create a 'State' worksheet to persist progress."""
+    try:
+        return spreadsheet.worksheet('State')
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title='State', rows=5, cols=2)
+        ws.update('A1:B4', [
+            ['keyword_index', '0'],
+            ['city_index', '0'],
+            ['details_used_today', '0'],
+            ['last_run_date', ''],
+        ])
+        print("[state] Created 'State' tab in Google Sheet")
+        return ws
+
+
+def load_state(state_ws):
+    """Load state from the State worksheet."""
+    data = state_ws.get_all_values()
+    state = {}
+    for row in data:
+        if len(row) >= 2:
+            state[row[0]] = row[1]
+    return {
+        'keyword_index': int(state.get('keyword_index', 0)),
+        'city_index': int(state.get('city_index', 0)),
+        'details_used_today': int(state.get('details_used_today', 0)),
+        'last_run_date': state.get('last_run_date', ''),
+    }
+
+
+def save_state(state_ws, state):
+    """Save state back to the State worksheet."""
+    state_ws.update('A1:B4', [
+        ['keyword_index', str(state['keyword_index'])],
+        ['city_index', str(state['city_index'])],
+        ['details_used_today', str(state['details_used_today'])],
+        ['last_run_date', state['last_run_date']],
+    ])
+    print(f"[state] Saved: keyword={state['keyword_index']}, city={state['city_index']}, details_used={state['details_used_today']}")
+
+
+state_ws = get_or_create_state_sheet(spreadsheet)
+state = load_state(state_ws)
+
+# Reset daily details counter if a new UTC day started
+today = datetime.datetime.utcnow().date().isoformat()
+if state['last_run_date'] != today:
+    state['details_used_today'] = 0
+    state['last_run_date'] = today
+
+# Prepare indices
+keyword_idx = state['keyword_index']
+city_idx = state['city_index']
+details_used = state['details_used_today']
+current_keyword = keywords[keyword_idx % len(keywords)]
+
+print(f"\n{'='*60}")
+print(f"  Starting run: keyword='{current_keyword}' ({keyword_idx+1}/{len(keywords)})")
+print(f"  Starting city index: {city_idx} ({all_cities[city_idx % len(all_cities)]})")
+print(f"  Details budget: {details_used}/{DAILY_DETAILS_BUDGET}")
+print(f"{'='*60}")
+
+new_leads = []
+processed_cities = 0
 
 while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities):
-    city = all_cities[city_idx]
+    city = all_cities[city_idx % len(all_cities)]
     print(f"\n--- Processing city: {city} | keyword: {current_keyword} ---")
     # 1️⃣ Get place IDs for this city+keyword (free unlimited call)
     place_ids = fetch_place_ids(current_keyword, city, limit=MAX_RESULTS_PER_CITY)
     print(f"[main] Got {len(place_ids)} place IDs for '{city}'")
     if not place_ids:
         print(f"[main] No place IDs found, skipping city")
-        city_idx = (city_idx + 1) % len(all_cities)
+        city_idx += 1
         processed_cities += 1
         continue
     # 2️⃣ For each ID, fetch full details (costly call, counts against quota)
@@ -107,7 +150,7 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
         }
         # Generate WhatsApp number: country code + number, digits only, no + sign
         intl = details.get('international_phone_number') or ''
-        whatsapp = re.sub(r'[^0-9]', '', intl)  # strip everything except digits
+        whatsapp = re.sub(r'[^0-9]', '', intl)
         lead['whatsapp'] = whatsapp
         # Optional email enrichment (does NOT use Google quota)
         if os.getenv('ENABLE_EMAIL_ENRICH', 'true').lower() == 'true':
@@ -119,8 +162,14 @@ while details_used < DAILY_DETAILS_BUDGET and processed_cities < len(all_cities)
             new_leads.append(lead)
         details_used += 1
     # move to next city
-    city_idx = (city_idx + 1) % len(all_cities)
+    city_idx += 1
     processed_cities += 1
+
+# When all cities are done for this keyword, move to next keyword
+if city_idx >= len(all_cities):
+    keyword_idx = (keyword_idx + 1) % len(keywords)
+    city_idx = 0
+    print(f"\n[main] All cities done for '{current_keyword}'. Next keyword: '{keywords[keyword_idx]}'")
 
 # ----------------------------------------------------------------------
 # Deduplicate against existing sheet entries
@@ -161,10 +210,9 @@ else:
     print(f"No new leads for keyword '{current_keyword}'.")
 
 # ----------------------------------------------------------------------
-# Persist updated state for next run
+# Persist updated state to Google Sheet (survives across CI runs)
 # ----------------------------------------------------------------------
-state["keyword_index"] = (keyword_idx + (city_idx == 0)) % len(keywords)
-state["city_index"] = city_idx
-state["details_used_today"] = details_used
-with open(state_path, "w") as sf:
-    json.dump(state, sf, indent=2)
+state['keyword_index'] = keyword_idx
+state['city_index'] = city_idx
+state['details_used_today'] = details_used
+save_state(state_ws, state)
