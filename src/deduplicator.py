@@ -1,9 +1,9 @@
 import gspread
 
 def get_existing_identifiers(sheet):
-    # Column K (index 11) = place_id, Column E (index 5) = email (may be blank)
-    place_ids = set(sheet.col_values(11)[1:])  # skip header
-    emails = set(sheet.col_values(5)[1:])
+    # Column M (index 13) = place_id, Column F (index 6) = email (may be blank)
+    place_ids = set(sheet.col_values(13)[1:])  # skip header
+    emails = set(sheet.col_values(6)[1:])
     return place_ids, emails
 
 def filter_new_leads(leads, existing_ids, existing_emails):
