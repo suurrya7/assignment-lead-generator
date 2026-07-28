@@ -4,7 +4,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 from src.places_fetcher import fetch_place_ids
 from src.place_details import fetch_place_details
 from src.validator import validate_lead
-from src.deduplicator import get_existing_identifiers, filter_new_leads
+from src.deduplicator import get_existing_identifiers
 from src.email_enricher import enrich_email_if_needed
 
 
@@ -94,9 +94,13 @@ def load_state(state_ws):
 
 def save_state(state_ws, state):
     """Save state back to the State worksheet."""
+    state_ws.update_acell('A1', 'keyword_index')
     state_ws.update_acell('B1', str(state['keyword_index']))
+    state_ws.update_acell('A2', 'city_index')
     state_ws.update_acell('B2', str(state['city_index']))
+    state_ws.update_acell('A3', 'details_used_today')
     state_ws.update_acell('B3', str(state['details_used_today']))
+    state_ws.update_acell('A4', 'last_run_date')
     state_ws.update_acell('B4', state['last_run_date'])
     print(f"[state] Saved: keyword={state['keyword_index']}, city={state['city_index']}, details_used={state['details_used_today']}")
 
@@ -204,7 +208,15 @@ if city_idx >= len(all_cities) and not budget_hit:
 # ----------------------------------------------------------------------
 # Deduplicate again just in case (email duplicates, etc.)
 # ----------------------------------------------------------------------
-new_leads = filter_new_leads(new_leads, existing_ids, existing_emails)
+final_leads = []
+for lead in new_leads:
+    if lead.get('email') and lead['email'] in existing_emails:
+        continue
+    final_leads.append(lead)
+    if lead.get('email'):
+        existing_emails.add(lead['email'])
+print(f"Deduplication: {len(new_leads)} raw → {len(final_leads)} new unique leads")
+new_leads = final_leads
 
 # Optional safety cap on how many rows we write in one run
 if len(new_leads) > MAX_NEW_LEADS_PER_RUN:
